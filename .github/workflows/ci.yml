@@ -1,0 +1,25 @@
+
+name: MERN PROJECT CI/CD
+
+'on':
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  docker-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose
+        run: |
+          touch backend/.env
+          docker compose -p mern-practice config --quiet
+
+      - name: Build Docker images
+        run: |
+          docker compose -p mern-practice build

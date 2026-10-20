@@ -1,0 +1,113 @@
+name: MERN CD
+
+on:
+  workflow_dispatch:
+  # push:
+  #   branches: [main]
+  #   paths-ignore:
+  #     - '**.md'
+  #     - '.cursor/**'
+  #     - '.github/workflows/ci.yml'
+
+concurrency:
+  group: mern-cd-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
+
+      - name: Trust VPS host key
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Verify SSH connection
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          ssh -o BatchMode=yes -o ConnectTimeout=15 \
+            "$VPS_USER@$VPS_HOST" 'echo "SSH OK as $(whoami) on $(hostname)"'
+
+      - name: Deploy with Docker Compose
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
+          REPO_URL: https://github.com/${{ github.repository }}.git
+        run: |
+          set -euo pipefail
+
+          # Keep ~ literal so it expands on the VPS, not on the runner
+          if [ -z "${DEPLOY_PATH:-}" ]; then
+            DEPLOY_PATH='/opt/merndevopslab'
+          fi
+
+          ssh -o BatchMode=yes -o ConnectTimeout=15 "$VPS_USER@$VPS_HOST" \
+            DEPLOY_PATH="$DEPLOY_PATH" REPO_URL="$REPO_URL" bash -s <<'REMOTE'
+          set -euo pipefail
+
+          # Expand ~ on the VPS
+          DEPLOY_PATH="${DEPLOY_PATH/#\~/$HOME}"
+          echo "==> Deploy path: $DEPLOY_PATH"
+
+          if [ ! -d "$DEPLOY_PATH/.git" ]; then
+            echo "==> Repo missing — cloning $REPO_URL"
+            mkdir -p "$(dirname "$DEPLOY_PATH")"
+            git clone --branch main "$REPO_URL" "$DEPLOY_PATH"
+          fi
+
+          cd "$DEPLOY_PATH"
+
+          echo "==> Updating code"
+          git remote set-url origin "$REPO_URL"
+          git fetch --prune origin
+          git checkout main
+          git reset --hard origin/main
+
+          echo "==> Ensuring runtime files"
+          mkdir -p nginx/cache
+          if [ ! -f backend/.env ]; then
+            if [ -f backend/.env.example ]; then
+              cp backend/.env.example backend/.env
+              echo "Created backend/.env from example — update secrets on the VPS if needed"
+            else
+              echo "PORT=5000" > backend/.env
+              echo "MONGODB_URI=mongodb://mongo:27017/mern-todos" >> backend/.env
+            fi
+          fi
+
+          echo "==> Building and starting stack"
+          docker compose -p merndevopslab up -d --build --remove-orphans
+
+          echo "==> Waiting for API health"
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://127.0.0.1:8082/api/health >/dev/null 2>&1; then
+              echo "Health check passed"
+              curl -fsS http://127.0.0.1:8082/api/health
+              echo
+              docker compose -p merndevopslab ps
+              exit 0
+            fi
+            echo "Attempt $i/10 — not ready yet"
+            sleep 6
+          done
+
+          echo "Health check failed"
+          docker compose -p merndevopslab ps
+          docker compose -p merndevopslab logs --tail=80
+          exit 1
+          REMOTE
