@@ -2,16 +2,10 @@ name: MERN CD
 
 on:
   workflow_dispatch:
-  # push:
-  #   branches: [main]
-  #   paths-ignore:
-  #     - '**.md'
-  #     - '.cursor/**'
-  #     - '.github/workflows/ci.yml'
 
 concurrency:
-  group: mern-cd-production
-  cancel-in-progress: true
+  group: merndevopslab-deploy
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -29,16 +23,35 @@ jobs:
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+
+          tmp_kh="$(mktemp)"
+          ssh-keyscan -H -t ed25519 "$VPS_HOST" > "$tmp_kh"
+
+          actual="$(ssh-keygen -lf "$tmp_kh" -E sha256 | awk '{print $2}')"
+          expected="SHA256:FxarV4XwuCJSgdXYRRSmHtRvgljrAji0RFAZIa/+pL8"
+
+          if [ -z "$actual" ] || [ "$actual" != "$expected" ]; then
+            echo "ERROR: SSH host fingerprint mismatch (fail-closed)"
+            echo "expected: $expected"
+            echo "actual:   ${actual:-<empty>}"
+            rm -f "$tmp_kh"
+            exit 1
+          fi
+
+          cat "$tmp_kh" >> ~/.ssh/known_hosts
+          rm -f "$tmp_kh"
           chmod 644 ~/.ssh/known_hosts
+          echo "SSH host fingerprint verified"
 
       - name: Verify SSH connection
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
+          set -euo pipefail
           ssh -o BatchMode=yes -o ConnectTimeout=15 \
             "$VPS_USER@$VPS_HOST" 'echo "SSH OK as $(whoami) on $(hostname)"'
 
@@ -47,67 +60,117 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
-          REPO_URL: https://github.com/${{ github.repository }}.git
+          REPO_URL: git@github.com:AnasIsmail8996/merndevopslab.git
         run: |
           set -euo pipefail
 
-          # Keep ~ literal so it expands on the VPS, not on the runner
           if [ -z "${DEPLOY_PATH:-}" ]; then
             DEPLOY_PATH='/opt/merndevopslab'
           fi
 
-          ssh -o BatchMode=yes -o ConnectTimeout=15 "$VPS_USER@$VPS_HOST" \
-            DEPLOY_PATH="$DEPLOY_PATH" REPO_URL="$REPO_URL" bash -s <<'REMOTE'
+          # Runner-side: pass only safe env into the remote script.
+          # Quoted heredoc ('REMOTE') prevents runner expansion inside the body.
+          ssh -o BatchMode=yes -o ConnectTimeout=15 \
+            "$VPS_USER@$VPS_HOST" \
+            DEPLOY_PATH="$DEPLOY_PATH" \
+            REPO_URL="$REPO_URL" \
+            bash -s <<'REMOTE'
           set -euo pipefail
 
-          # Expand ~ on the VPS
+          EXPECTED_DEPLOY_PATH="/opt/merndevopslab"
+          EXPECTED_REPO_URL="git@github.com:AnasIsmail8996/merndevopslab.git"
+          EXPECTED_BRANCH="main"
+          COMPOSE_PROJECT="merndevopslab"
+          DEPLOY_KEY="/home/deploy/.ssh/merndevopslab_deploy"
+
+          export GIT_SSH_COMMAND="ssh -i ${DEPLOY_KEY} -o IdentitiesOnly=yes -o BatchMode=yes"
+
+          # Expand a leading ~ on the VPS only
           DEPLOY_PATH="${DEPLOY_PATH/#\~/$HOME}"
+
+          if [ "$DEPLOY_PATH" != "$EXPECTED_DEPLOY_PATH" ]; then
+            echo "ERROR: Refusing deploy path '$DEPLOY_PATH' (expected $EXPECTED_DEPLOY_PATH)"
+            exit 1
+          fi
+
+          if [ "$REPO_URL" != "$EXPECTED_REPO_URL" ]; then
+            echo "ERROR: Refusing repository URL (expected $EXPECTED_REPO_URL)"
+            exit 1
+          fi
+
+          if [ ! -f "$DEPLOY_KEY" ]; then
+            echo "ERROR: Missing Git deploy key at $DEPLOY_KEY"
+            exit 1
+          fi
+
           echo "==> Deploy path: $DEPLOY_PATH"
 
           if [ ! -d "$DEPLOY_PATH/.git" ]; then
             echo "==> Repo missing — cloning $REPO_URL"
             mkdir -p "$(dirname "$DEPLOY_PATH")"
-            git clone --branch main "$REPO_URL" "$DEPLOY_PATH"
+            git clone --branch "$EXPECTED_BRANCH" "$REPO_URL" "$DEPLOY_PATH"
           fi
 
           cd "$DEPLOY_PATH"
+          if [ "$(pwd -P)" != "$EXPECTED_DEPLOY_PATH" ]; then
+            echo "ERROR: Wrong deployment directory after cd: $(pwd -P)"
+            exit 1
+          fi
 
-          echo "==> Updating code"
-          git remote set-url origin "$REPO_URL"
+          echo "==> Updating code (fail-closed)"
+          git remote set-url origin "$EXPECTED_REPO_URL"
+
+          origin_url="$(git remote get-url origin)"
+          if [ "$origin_url" != "$EXPECTED_REPO_URL" ]; then
+            echo "ERROR: origin remote mismatch: $origin_url"
+            exit 1
+          fi
+
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "ERROR: Working tree is dirty — refusing destructive git reset"
+            git status --porcelain
+            exit 1
+          fi
+
           git fetch --prune origin
-          git checkout main
-          git reset --hard origin/main
+
+          if ! git rev-parse --verify "origin/${EXPECTED_BRANCH}" >/dev/null 2>&1; then
+            echo "ERROR: origin/${EXPECTED_BRANCH} not found after fetch"
+            exit 1
+          fi
+
+          git checkout "$EXPECTED_BRANCH"
+          git reset --hard "origin/${EXPECTED_BRANCH}"
 
           echo "==> Ensuring runtime files"
           mkdir -p nginx/cache
+
           if [ ! -f backend/.env ]; then
-            if [ -f backend/.env.example ]; then
-              cp backend/.env.example backend/.env
-              echo "Created backend/.env from example — update secrets on the VPS if needed"
-            else
-              echo "PORT=5000" > backend/.env
-              echo "MONGODB_URI=mongodb://mongo:27017/mern-todos" >> backend/.env
-            fi
+            echo "ERROR: backend/.env is missing on the VPS"
+            echo "Create it manually with production values before deploying."
+            echo "Refusing to invent placeholder secrets."
+            exit 1
           fi
 
-          echo "==> Building and starting stack"
-          docker compose -p merndevopslab up -d --build --remove-orphans
+          echo "==> Building and starting stack (project=$COMPOSE_PROJECT)"
+          docker compose -p "$COMPOSE_PROJECT" up -d --build
 
-          echo "==> Waiting for API health"
+          echo "==> Waiting for API health at http://127.0.0.1:8082/api/health"
+          echo "NOTE: Health OK confirms process reachability only — not full feature coverage."
           for i in 1 2 3 4 5 6 7 8 9 10; do
-            if curl -fsS http://127.0.0.1:8082/api/health >/dev/null 2>&1; then
+            if curl -fsS "http://127.0.0.1:8082/api/health" >/dev/null 2>&1; then
               echo "Health check passed"
-              curl -fsS http://127.0.0.1:8082/api/health
+              curl -fsS "http://127.0.0.1:8082/api/health"
               echo
-              docker compose -p merndevopslab ps
+              docker compose -p "$COMPOSE_PROJECT" ps
               exit 0
             fi
-            echo "Attempt $i/10 — not ready yet"
+            echo "Attempt ${i}/10 — not ready yet"
             sleep 6
           done
 
           echo "Health check failed"
-          docker compose -p merndevopslab ps
-          docker compose -p merndevopslab logs --tail=80
+          docker compose -p "$COMPOSE_PROJECT" ps
+          docker compose -p "$COMPOSE_PROJECT" logs --tail=80
           exit 1
           REMOTE

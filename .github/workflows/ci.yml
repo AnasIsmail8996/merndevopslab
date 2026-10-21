@@ -1,7 +1,6 @@
+name: MERN CI
 
-name: MERN PROJECT CI/CD
-
-'on':
+on:
   push:
     branches: [main]
   pull_request:
@@ -10,6 +9,7 @@ name: MERN PROJECT CI/CD
 jobs:
   docker-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout code
@@ -17,9 +17,21 @@ jobs:
 
       - name: Validate Docker Compose
         run: |
+          set -euo pipefail
           touch backend/.env
-          docker compose -p mern-practice config --quiet
+          docker compose -p merndevopslab config --quiet
+
+          # Fail if expected API services are missing from the rendered config
+          cfg="$(docker compose -p merndevopslab config)"
+          for svc in api1 api2 api3 mongo frontend nginx; do
+            echo "$cfg" | grep -qE "^  ${svc}:" || {
+              echo "ERROR: expected service '${svc}' not found in compose config"
+              exit 1
+            }
+          done
+          echo "Compose project merndevopslab and services validated"
 
       - name: Build Docker images
         run: |
-          docker compose -p mern-practice build
+          set -euo pipefail
+          docker compose -p merndevopslab build
